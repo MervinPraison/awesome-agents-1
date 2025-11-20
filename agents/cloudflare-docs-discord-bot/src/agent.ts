@@ -1,5 +1,4 @@
 import { Agent } from 'agents';
-import { CloudflareMCPClient } from './mcp-client';
 import type { Env, AgentState, Message } from './types';
 import { withTimeout } from './utils';
 
@@ -11,12 +10,10 @@ import { withTimeout } from './utils';
  *
  * This agent:
  * - Uses the Agents SDK for state and lifecycle management
- * - Integration with Cloudflare's doc site MCP
+ * - Integration with Cloudflare's doc site MCP using custom HTTP-based client
  * - Using Workers AI for inference (with OpenAI example included)
  */
 export class CloudflareDocsAgent extends Agent<Env, AgentState> {
-  private mcpClient: CloudflareMCPClient | null = null;
-  private initialized = false;
 
   // Define initial state structure - SDK will automatically persist this
   initialState: AgentState = {
@@ -27,24 +24,66 @@ export class CloudflareDocsAgent extends Agent<Env, AgentState> {
     lastActivity: new Date().toISOString(),
   };
 
-
   async onStart(): Promise<void> {
-    // Initialize MCP client
-    this.mcpClient = new CloudflareMCPClient(this.env.MCP_SERVER_URL);
-    await this.mcpClient.initialize();
-    this.initialized = true;
+    // Note: Cannot initialize MCP here because addMcpServer() requires a request context
+    // MCP initialization happens on-demand in searchDocumentation()
+    console.log('[onStart] Agent started. MCP will be initialized on first request.');
   }
 
-// fetch entry point
-  async fetch(request: Request): Promise<Response> {
-    // Ensure agent is initialized before handling requests
-    if (!this.initialized) {
-      await this.onStart();
+  private async initializeMCP(): Promise<string | null> {
+    try {
+      console.log('[initializeMCP] Connecting to MCP server...');
+      console.log('[initializeMCP] MCP_SERVER_URL:', this.env.MCP_SERVER_URL);
+
+      const { id, authUrl } = await this.addMcpServer(
+        'CloudflareDocs',
+        this.env.MCP_SERVER_URL
+      );
+
+      console.log(`[initializeMCP] MCP server added with ID: ${id}`);
+      if (authUrl) {
+        console.log(`[initializeMCP] Auth URL: ${authUrl}`);
+      }
+
+      // Wait for the server to connect
+      console.log('[initializeMCP] Waiting for server to be ready...');
+      const maxRetries = 10;
+      const retryDelay = 500; // ms
+
+      for (let i = 0; i < maxRetries; i++) {
+        const state = await this.getMcpServers();
+        const server = state.servers[id];
+
+        console.log(`[initializeMCP] Attempt ${i + 1}/${maxRetries} - Server state: ${server?.state || 'unknown'}`);
+
+        if (server?.state === 'ready') {
+          console.log(`[initializeMCP] MCP server ready after ${(i + 1) * retryDelay}ms`);
+          return id;
+        }
+
+        if (server?.state === 'failed') {
+          console.error(`[initializeMCP] MCP server connection failed`);
+          return null;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
+
+      console.error('[initializeMCP] Timeout waiting for MCP server to be ready');
+      return id; // Return ID anyway, might work later
+
+    } catch (error) {
+      console.error('[initializeMCP] Failed to connect to MCP server:', error);
+      return null;
     }
+  }
+
+  // fetch entry point
+  async fetch(request: Request): Promise<Response> {
     return this.onRequest(request);
   }
 
-// handle requests
+  // handle requests
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -73,7 +112,7 @@ export class CloudflareDocsAgent extends Agent<Env, AgentState> {
     return new Response('Not Found', { status: 404 });
   }
 
-// handle /ask command
+  // handle /ask command
   private async handleAskQuestion(request: Request): Promise<Response> {
     try {
       const body = await request.json() as { question?: string; userId?: string; channelId?: string };
@@ -130,7 +169,7 @@ export class CloudflareDocsAgent extends Agent<Env, AgentState> {
     }
   }
 
-// generate answer using documentation search and AI
+  // generate answer using documentation search and AI
   private async generateAnswer(question: string): Promise<string> {
     try {
       // Search the documentation for relevant information
@@ -233,27 +272,117 @@ ${protectedDocs}`;
     }
   }
 
-  // documentation search
+  // documentation search using built-in MCP client
   private async searchDocumentation(query: string): Promise<string> {
-    if (!this.mcpClient) {
-      return 'Error searching documentation: MCP client not available';
-    }
-
     try {
-      const results = await this.mcpClient.searchDocumentation(query);
+      // Get current MCP server state (await the promise)
+      const mcpState = await this.getMcpServers();
+      const servers = mcpState.servers;
+      let serverId = Object.keys(servers)[0];
 
-      if (!results || results.trim().length === 0) {
-        return 'Error searching documentation: No results returned';
+      console.log('[searchDocumentation] MCP State:', JSON.stringify({
+        serverIds: Object.keys(servers),
+        serverStates: Object.fromEntries(
+          Object.entries(servers).map(([id, server]: [string, any]) => [id, server.state])
+        )
+      }));
+
+      // If no server found or server is stuck in a non-ready state, (re)initialize MCP
+      const serverState = serverId ? servers[serverId]?.state : null;
+      const isServerStuck = serverState && serverState !== 'ready' && serverState !== 'connecting' && serverState !== 'discovering';
+
+      if (!serverId || isServerStuck) {
+        if (serverId && isServerStuck) {
+          console.log(`[searchDocumentation] Server ${serverId} stuck in ${serverState} state. Removing and reconnecting...`);
+          try {
+            await this.removeMcpServer(serverId);
+            console.log(`[searchDocumentation] Removed stuck server ${serverId}`);
+          } catch (error) {
+            console.error('[searchDocumentation] Error removing stuck server:', error);
+          }
+        }
+
+        console.log('[searchDocumentation] Initializing MCP...');
+        const newServerId = await this.initializeMCP();
+        if (!newServerId) {
+          return 'Error searching documentation: Failed to initialize MCP server';
+        }
+        serverId = newServerId;
+
+        // Refresh servers list after initialization
+        const refreshedState = await this.getMcpServers();
+        const refreshedServer = refreshedState.servers[serverId];
+        if (!refreshedServer || refreshedServer.state !== 'ready') {
+          return `Error searching documentation: Server initialized but not ready (state: ${refreshedServer?.state || 'unknown'})`;
+        }
       }
 
-      return results;
+      // Check if server is ready
+      const server = servers[serverId];
+      if (server && server.state !== 'ready') {
+        console.log(`[searchDocumentation] Server ${serverId} is in state: ${server.state}. Waiting for ready state...`);
+
+        // Wait up to 5 seconds for the server to be ready
+        const maxWait = 10; // 10 attempts
+        for (let i = 0; i < maxWait; i++) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          const updatedState = await this.getMcpServers();
+          const updatedServer = updatedState.servers[serverId];
+
+          console.log(`[searchDocumentation] Wait attempt ${i + 1}/${maxWait} - Server state: ${updatedServer?.state || 'unknown'}`);
+
+          if (updatedServer?.state === 'ready') {
+            console.log('[searchDocumentation] Server is now ready');
+            break;
+          }
+
+          if (updatedServer?.state === 'failed') {
+            return `Error searching documentation: Server connection failed. Please check MCP_SERVER_URL: ${this.env.MCP_SERVER_URL}`;
+          }
+        }
+
+        // Final check
+        const finalState = await this.getMcpServers();
+        const finalServer = finalState.servers[serverId];
+        if (!finalServer || finalServer.state !== 'ready') {
+          return `Error searching documentation: Server not ready after 5 seconds (state: ${finalServer?.state || 'unknown'}). MCP_SERVER_URL: ${this.env.MCP_SERVER_URL}`;
+        }
+      }
+
+      // Get the MCP client - the beta version should have this working properly now
+      // Note: Accessing internal API until public tool-calling API is documented
+      // @ts-ignore - accessing internal property
+      const connection = this.mcp?.mcpConnections?.[serverId];
+
+      if (!connection || !connection.client) {
+        return 'Error searching documentation: MCP client not available';
+      }
+
+      // Call the MCP tool using the client
+      const result = await connection.client.callTool({
+        name: 'search_cloudflare_documentation',
+        arguments: { query }
+      });
+
+      // Parse the result content
+      if (!result || !result.content || !Array.isArray(result.content)) {
+        throw new Error('Invalid tool response format');
+      }
+
+      const textContent = result.content
+        .filter((item: any) => item.type === 'text')
+        .map((item: any) => item.text)
+        .join('\n\n');
+
+      return textContent || 'No documentation found';
+
     } catch (error) {
       console.error('[searchDocumentation] Error:', error);
       return `Error searching documentation: ${error instanceof Error ? error.message : 'Unknown error'}`;
     }
   }
 
-// build conversation context and history
+  // build conversation context and history
   private buildConversationContext(): Array<{ role: string; content: string }> {
     const maxMessages = 10; // Last 5 exchanges (user + assistant)
     const recentHistory = this.state.conversationHistory.slice(-maxMessages);

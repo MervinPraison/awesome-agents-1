@@ -1,0 +1,18 @@
+{
+  "name": "agents-addmcpserver-repro",
+  "version": "1.0.0",
+  "description": "Minimal reproduction for addMcpServer setName bug in agents@beta",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "agents": "^0.0.0-cf3b3d7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.47.0"
+  }
+}

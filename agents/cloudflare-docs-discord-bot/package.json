@@ -10,13 +10,11 @@
     "test": "vitest",
     "cf-typegen": "wrangler types"
   },
-  "keywords": [
-  ],
+  "keywords": [],
   "author": "Marc Selwan (mselwan@cloudflare.com)",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
-    "agents": "^0.1.0",
+    "agents": "^0.0.0-cf3b3d7",
     "discord-interactions": "^4.1.0"
   },
   "devDependencies": {

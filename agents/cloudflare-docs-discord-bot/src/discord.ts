@@ -3,12 +3,10 @@ import {
   InteractionType,
   verifyKey,
 } from 'discord-interactions';
+import { getAgentByName } from 'agents';
 import type { Env } from './types';
 import { withTimeout } from './utils';
 
-/**
- * Discord interaction types
- */
 export interface DiscordInteraction {
   type: number;
   id: string;
@@ -34,9 +32,7 @@ export interface DiscordInteraction {
   };
 }
 
-/**
- * Verify Discord request signature
- */
+// verify Discord request signature
 export async function verifyDiscordRequest(
   request: Request,
   publicKey: string
@@ -58,7 +54,6 @@ export async function handleDiscordInteraction(
   env: Env,
   ctx: ExecutionContext
 ): Promise<Response> {
-  // Handle PING
   if (interaction.type === InteractionType.PING) {
     return Response.json({
       type: InteractionResponseType.PONG,
@@ -108,17 +103,15 @@ async function handleAskCommand(
     });
   }
 
-  // Get user info
+  // user info
   const user = interaction.member?.user || interaction.user;
   const userId = user?.id || 'unknown';
   const channelId = interaction.channel_id || 'unknown';
-
-  // Defer the response since AI processing may take time
+  // defer response
   const deferResponse = Response.json({
     type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
   });
 
-  // Process the question asynchronously - use waitUntil to keep Worker alive
   ctx.waitUntil(
     handleQuestionAsync(interaction, question, userId, channelId, env)
   );
@@ -137,11 +130,10 @@ async function handleQuestionAsync(
   const followupUrl = `https://discord.com/api/v10/webhooks/${env.DISCORD_APPLICATION_ID}/${interaction.token}`;
 
   try {
-    // Get or create agent for this channel
-    const agentId = env.CLOUDFLARE_DOCS_AGENT.idFromName(channelId);
-    const agent = env.CLOUDFLARE_DOCS_AGENT.get(agentId);
+    // Get agent stub using the helper
+    const agent = await getAgentByName(env.CLOUDFLARE_DOCS_AGENT, channelId);
 
-    // Ask the question with timeout (30 seconds max)
+    // question with timeout (30 seconds max)
     const response = await withTimeout<Response>(
       agent.fetch('http://agent/ask', {
         method: 'POST',
@@ -234,8 +226,7 @@ async function handleResetCommand(
 ): Promise<Response> {
   try {
     const channelId = interaction.channel_id || 'unknown';
-    const agentId = env.CLOUDFLARE_DOCS_AGENT.idFromName(channelId);
-    const agent = env.CLOUDFLARE_DOCS_AGENT.get(agentId);
+    const agent = await getAgentByName(env.CLOUDFLARE_DOCS_AGENT, channelId);
 
     await agent.fetch('http://agent/reset', {
       method: 'POST',

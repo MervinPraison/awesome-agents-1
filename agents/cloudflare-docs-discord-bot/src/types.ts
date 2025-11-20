@@ -1,9 +1,11 @@
+import type { CloudflareDocsAgent } from './agent';
+
 /**
  * Environment bindings for the Cloudflare Worker
  */
 export interface Env {
   // Durable Object binding
-  CLOUDFLARE_DOCS_AGENT: DurableObjectNamespace;
+  CLOUDFLARE_DOCS_AGENT: DurableObjectNamespace<CloudflareDocsAgent>;
 
   // Workers AI binding
   AI: Ai;
@@ -48,20 +50,7 @@ export interface ToolCall {
 }
 
 /**
- * MCP Tool definition
- */
-export interface MCPTool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, unknown>;
-    required?: string[];
-  };
-}
-
-/**
- * Response from the MCP server
+ * MCP Response structure
  */
 export interface MCPResponse {
   content: Array<{
