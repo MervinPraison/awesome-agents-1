@@ -114,6 +114,54 @@ export function renderDashboard(): string {
       word-break: break-word;
     }
     .empty { color: var(--text-muted); font-style: italic; padding: 20px 0; text-align: center; }
+    .mcp-form { display: flex; gap: 8px; margin-bottom: 16px; }
+    .mcp-form input {
+      flex: 1;
+      font-family: inherit;
+      font-size: 13px;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .mcp-form input::placeholder { color: var(--text-muted); }
+    .mcp-form input:focus { outline: none; border-color: var(--accent); }
+    .server-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px;
+      background: rgba(255,255,255,0.02);
+      border-radius: 6px;
+      margin-bottom: 8px;
+    }
+    .server-item:last-child { margin-bottom: 0; }
+    .server-info { flex: 1; }
+    .server-name { font-weight: 500; margin-bottom: 2px; }
+    .server-url { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+    .server-state { font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-left: 12px; }
+    .server-state.ready { background: rgba(16,185,129,0.2); color: #10b981; }
+    .server-state.authenticating { background: rgba(245,158,11,0.2); color: #f59e0b; }
+    .server-state.connecting, .server-state.discovering { background: rgba(59,130,246,0.2); color: #3b82f6; }
+    .server-state.failed { background: rgba(239,68,68,0.2); color: #ef4444; }
+    .btn-remove {
+      padding: 4px 8px;
+      font-size: 11px;
+      background: transparent;
+      border-color: #ef4444;
+      color: #ef4444;
+    }
+    .btn-remove:hover { background: rgba(239,68,68,0.1); }
+    .tool-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .tool-tag {
+      font-size: 11px;
+      padding: 4px 8px;
+      background: rgba(139,92,246,0.15);
+      color: #a78bfa;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+    }
   </style>
 </head>
 <body>
@@ -138,6 +186,17 @@ export function renderDashboard(): string {
       <div class="card">
         <div class="card-title">Storage</div>
         <div id="stats" class="mono">Loading...</div>
+      </div>
+
+      <div class="card full">
+        <div class="card-title">MCP Servers</div>
+        <div class="mcp-form">
+          <input type="text" id="mcpName" placeholder="Server name">
+          <input type="text" id="mcpUrl" placeholder="https://mcp-server.example.com/mcp">
+          <button id="addMcpBtn">Connect</button>
+        </div>
+        <div id="mcpServers">Loading...</div>
+        <div id="mcpTools"></div>
       </div>
 
       <div class="card full">
@@ -187,6 +246,37 @@ export function renderDashboard(): string {
       <div class="block-value mono">\${esc(b.value)}</div>
     </div>\`;
 
+    async function loadMcp() {
+      try {
+        const mcp = await (await fetch('/api/mcp/servers')).json();
+        const servers = Object.entries(mcp.servers || {});
+        if (servers.length === 0) {
+          document.getElementById('mcpServers').innerHTML = '<div class="empty">No MCP servers connected</div>';
+        } else {
+          document.getElementById('mcpServers').innerHTML = servers.map(([id, srv]) => \`
+            <div class="server-item">
+              <div class="server-info">
+                <div class="server-name">\${esc(srv.name)}</div>
+                <div class="server-url">\${esc(srv.server_url)}</div>
+              </div>
+              <span class="server-state \${srv.state}">\${srv.state}</span>
+              \${srv.state === 'authenticating' ? \`<a href="\${srv.auth_url}" target="_blank"><button>Authenticate</button></a>\` : ''}
+              <button class="btn-remove" onclick="removeMcp('\${id}')">Remove</button>
+            </div>
+          \`).join('');
+        }
+        const tools = mcp.tools || [];
+        if (tools.length > 0) {
+          document.getElementById('mcpTools').innerHTML = \`
+            <div style="margin-top: 12px; font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em;">Available Tools (\${tools.length})</div>
+            <div class="tool-list">\${tools.map(t => \`<span class="tool-tag">\${esc(t.name)}</span>\`).join('')}</div>
+          \`;
+        } else {
+          document.getElementById('mcpTools').innerHTML = '';
+        }
+      } catch (e) { console.error('MCP load error:', e); }
+    }
+
     async function load() {
       try {
         const s = await (await fetch('/api/state')).json();
@@ -205,6 +295,7 @@ export function renderDashboard(): string {
         const all = s.storage.allMessages || [];
         document.getElementById('messages').innerHTML = all.length ? all.map(renderMsg).join('') : '<div class="empty">No messages</div>';
         document.getElementById('status').textContent = new Date().toLocaleTimeString();
+        await loadMcp();
       } catch (e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
     }
 
@@ -214,6 +305,39 @@ export function renderDashboard(): string {
       document.getElementById('status').textContent = ok ? 'Gateway started' : 'Failed';
     };
     document.getElementById('refreshBtn').onclick = load;
+
+    document.getElementById('addMcpBtn').onclick = async () => {
+      const name = document.getElementById('mcpName').value.trim();
+      const url = document.getElementById('mcpUrl').value.trim();
+      if (!name || !url) return alert('Please enter both name and URL');
+      document.getElementById('addMcpBtn').textContent = 'Connecting...';
+      try {
+        const res = await fetch('/api/mcp/servers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, url })
+        });
+        const result = await res.json();
+        if (result.state === 'authenticating') {
+          window.open(result.authUrl, '_blank');
+        }
+        document.getElementById('mcpName').value = '';
+        document.getElementById('mcpUrl').value = '';
+        await loadMcp();
+      } catch (e) { alert('Failed: ' + e.message); }
+      document.getElementById('addMcpBtn').textContent = 'Connect';
+    };
+
+    window.removeMcp = async (id) => {
+      if (!confirm('Remove this MCP server?')) return;
+      await fetch('/api/mcp/servers', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      await loadMcp();
+    };
+
     load();
     setInterval(load, 5000);
   </script>

@@ -1,7 +1,6 @@
 import { Agent } from "agents";
 import { PersistedObject } from "../persisted";
 import type { Interaction, MessageParams, Info } from "./types";
-export type { Interaction, MessageParams, Info };
 
 // Rate‑limit friendly fetch for Discord REST
 export async function discordFetch(

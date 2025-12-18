@@ -180,6 +180,29 @@ export class MyAgent extends DiscordAgent {
       return this.getStateJson();
     }
 
+    if (url.pathname === "/api/mcp/servers" && request.method === "GET") {
+      const mcpState = this.getMcpServers();
+      return new Response(JSON.stringify(mcpState, null, 2), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.pathname === "/api/mcp/servers" && request.method === "POST") {
+      const { name, url: serverUrl } = await request.json<{ name: string; url: string }>();
+      const result = await this.addMcpServer(name, serverUrl);
+      return new Response(JSON.stringify(result), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.pathname === "/api/mcp/servers" && request.method === "DELETE") {
+      const { id } = await request.json<{ id: string }>();
+      await this.removeMcpServer(id);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     return new Response(renderDashboard(), {
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
@@ -265,12 +288,16 @@ export class MyAgent extends DiscordAgent {
       apiKey: this.env.OPENROUTER_API_KEY,
     });
 
+    // Merge local tools with MCP tools
+    const mcpTools = this.mcp.getAITools();
+    const allTools = { ...tools, ...mcpTools };
+
     // Generate response with automatic tool execution
     const result = await generateText({
       model: openrouter(MODEL),
       system: systemPrompt,
       messages,
-      tools,
+      tools: allTools,
       stopWhen: stepCountIs(10),
     });
     console.log(JSON.stringify(result))
