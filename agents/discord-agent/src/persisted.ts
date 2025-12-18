@@ -1,20 +1,22 @@
-type Options = {
+type Options<T extends Record<string, unknown>> = {
   /** Prefix all keys */
   prefix?: string;
   /** Warn on mutations (default: true) */
   warnOnMutation?: boolean;
+  /** Default values for properties when not in KV */
+  defaults?: Partial<T>;
 };
 
 const INTERNAL = Symbol("kv-state:internal");
 const PERSISTED_REF = "__persistedRef__";
 
-// DurableObject was taken
 export function PersistedObject<T extends Record<string, unknown>>(
   kv: SyncKvStorage,
-  opts: Options = {}
+  opts: Options<T> = {}
 ): T {
   const prefix = opts.prefix ?? "";
   const warnOnMutation = opts.warnOnMutation ?? true;
+  const defaults = opts.defaults ?? ({} as Record<string, unknown>);
   const cache = new Map<string, unknown>();
 
   const keyOf = (prop: string) => prefix + prop;
@@ -69,7 +71,7 @@ export function PersistedObject<T extends Record<string, unknown>>(
       deleteProperty(target, prop) {
         console.error(
           `⚠️ Persited Object: Delete detected on ${propName}.${String(prop)}. ` +
-            `This will NOT persist. Use reassignment to remove properties.`
+            "This will NOT persist. Use reassignment to remove properties."
         );
         return Reflect.deleteProperty(target, prop);
       }
@@ -102,8 +104,11 @@ export function PersistedObject<T extends Record<string, unknown>>(
         return nested;
       }
 
+      // If no value in KV, check for default
+      const valueToWrap = v !== undefined ? v : defaults[prop];
+
       // Wrap arrays/objects with mutation detection
-      const wrapped = wrapWithMutationWarning(v, prop);
+      const wrapped = wrapWithMutationWarning(valueToWrap, prop);
       cache.set(k, wrapped);
       return wrapped;
     },

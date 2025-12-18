@@ -70,8 +70,5 @@ export type MessageParams = {
 
 export type Info = {
   userId?: string;
-  guildId?: string;
-  dmChannel: string;
-  discordToken: string;
-  isListening: boolean;
+  dmChannel?: string;
 };

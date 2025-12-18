@@ -1,8 +1,6 @@
 import { getAgentByName } from "agents";
 import { DurableObject } from "cloudflare:workers";
 import { PersistedObject } from "../persisted";
-import { discordFetch } from "../utils";
-import type { DiscordChannel, DiscordMessage } from "./types";
 
 const GATEWAY_ENDPOINT = "https://discord.com/api/v10/gateway";
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -28,7 +26,6 @@ export class DiscordGateway extends DurableObject<Env> {
   async start() {
     console.log("starting discord gateway");
     if (this.ws) {
-      console.log("WebSocket connection already exists, skipping start...");
       return;
     }
 
@@ -84,16 +81,10 @@ export class DiscordGateway extends DurableObject<Env> {
 
   private identify() {
     const INTENTS = {
-      GUILDS: 1 << 0,
-      GUILD_MESSAGES: 1 << 9,
       DIRECT_MESSAGES: 1 << 12,
       MESSAGE_CONTENT: 1 << 15
     };
-    const intents =
-      INTENTS.GUILDS |
-      INTENTS.GUILD_MESSAGES |
-      INTENTS.DIRECT_MESSAGES |
-      INTENTS.MESSAGE_CONTENT;
+    const intents = INTENTS.DIRECT_MESSAGES | INTENTS.MESSAGE_CONTENT;
     this.ws?.send(
       JSON.stringify({
         op: 2,
@@ -107,85 +98,15 @@ export class DiscordGateway extends DurableObject<Env> {
   }
 
   private async onDispatch(t: string, d: any) {
-    if (t === "MESSAGE_CREATE" && !d.author?.bot && !!d.content) {
-      const botId = this.env.DISCORD_APPLICATION_ID;
-
-      if (!d.guild_id) {
-        // DM
-        const agent = await getAgentByName(this.env.AGENT, `dm:${d.author.id}`);
-        await agent.onDmMessage({
-          channelId: d.channel_id,
-          authorId: d.author.id,
-          content: d.content || "",
-          id: d.id
-        });
-        return;
-      }
-
-      // Guild: check if mentioned or in a bot-started thread
-      const mentioned =
-        Array.isArray(d.mentions) &&
-        d.mentions.some((m: any) => m.id === botId);
-
-      const inBotThread = await this.isInBotStartedThread(d.channel_id, botId);
-
-      if (!mentioned && !inBotThread) return;
-
-      const agentName = `guild:${d.guild_id}`;
-      console.log(
-        `[Gateway] Routing to agent: ${agentName}, channel: ${d.channel_id}`
-      );
-      const agent = await getAgentByName(this.env.AGENT, agentName);
-      await agent.onGuildMessage({
-        guildId: d.guild_id,
+    // Only handle DM messages from non-bots
+    if (t === "MESSAGE_CREATE" && !d.author?.bot && !d.guild_id && d.content) {
+      const agent = await getAgentByName(this.env.AGENT, "default");
+      await agent.onDmMessage({
         channelId: d.channel_id,
         authorId: d.author.id,
-        content: d.content ?? "",
+        content: d.content,
         id: d.id
       });
-    }
-  }
-
-  private async isInBotStartedThread(
-    channelId: string,
-    botId: string
-  ): Promise<boolean> {
-    try {
-      // Fetch channel info to check if it's a thread
-      const channelRes = await discordFetch(`/channels/${channelId}`, {
-        method: "GET",
-        botToken: this.env.DISCORD_BOT_TOKEN
-      });
-
-      if (!channelRes.ok) return false;
-
-      const channel = await channelRes.json<DiscordChannel>();
-
-      // Channel types: 11 = public thread, 12 = private thread, 10 = announcement thread
-      const isThread = [10, 11, 12].includes(channel.type);
-      if (!isThread) return false;
-
-      // Check if thread has a starter message created by the bot
-      // Threads created from messages have the original message as the starter
-      if (channel.owner_id === botId) return true;
-
-      // Alternatively, fetch the starter message if available
-      const starterMessageId = channel.id; // In Discord, the thread ID is the same as the starter message ID
-      const messageRes = await discordFetch(
-        `/channels/${channel.parent_id}/messages/${starterMessageId}`,
-        {
-          method: "GET",
-          botToken: this.env.DISCORD_BOT_TOKEN
-        }
-      );
-
-      if (!messageRes.ok) return false;
-
-      const message = await messageRes.json<DiscordMessage>();
-      return message.author.id === botId;
-    } catch (error) {
-      console.error("Error checking thread ownership:", error);
-      return false;
     }
   }
 

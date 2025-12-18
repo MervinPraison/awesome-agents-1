@@ -1,21 +1,35 @@
-import { Agent, getAgentByName } from "agents";
+import { Agent } from "agents";
 import { PersistedObject } from "../persisted";
-import { DISCORD_API, discordFetch } from "../utils";
-import type {
-  DiscordMessage,
-  DiscordChannel,
-  Interaction,
-  MessageParams,
-  Info
-} from "./types";
+import type { Interaction, MessageParams, Info } from "./types";
+export type { Interaction, MessageParams, Info };
 
-export type {
-  DiscordMessage,
-  DiscordChannel,
-  Interaction,
-  MessageParams,
-  Info
-};
+// Rate‑limit friendly fetch for Discord REST
+export async function discordFetch(
+  path: string,
+  init: RequestInit & { botToken: string }
+): Promise<Response> {
+  const headers = new Headers(init.headers || {});
+  headers.set("Authorization", `Bot ${init.botToken}`);
+  if (
+    !headers.has("Content-Type") &&
+    init.body &&
+    !(init.body instanceof FormData)
+  ) {
+    headers.set("Content-Type", "application/json; charset=utf-8");
+  }
+  const res = await fetch(`${DISCORD_API}${path}`, { ...init, headers });
+
+  if (res.status !== 429) return res;
+
+  // Respect per-route/global limits. Retry once after retry_after.
+  // (Discord says: parse headers/body, don't hardcode numbers.)
+  const data: any = await res.json().catch(() => ({}));
+  const retryAfterMs = Math.ceil((data.retry_after ?? 1) * 1000);
+  await new Promise((r) => setTimeout(r, retryAfterMs));
+  return fetch(`${DISCORD_API}${path}`, { ...init, headers });
+}
+
+export const DISCORD_API = "https://discord.com/api/v10";
 
 export class DiscordAgent extends Agent {
   readonly info: Info;
@@ -24,12 +38,6 @@ export class DiscordAgent extends Agent {
     super(ctx, env);
     const kv = ctx.storage.kv;
     this.info = PersistedObject<Info>(kv, { prefix: "info_" });
-  }
-
-  async onInteraction(_i: Interaction): Promise<MessageParams | string> {
-    throw new Error(
-      "Received Discord interaction but you didn't override onInteraction"
-    );
   }
 
   async onDmMessage(_msg: {
@@ -46,7 +54,7 @@ export class DiscordAgent extends Agent {
     const res = await discordFetch(`/users/@me/channels`, {
       method: "POST",
       botToken: this.env.DISCORD_BOT_TOKEN,
-      body: JSON.stringify({ recipient_id: this.info.userId })
+      body: JSON.stringify({ recipient_id: this.info.userId }),
     });
     if (!res.ok)
       throw new Error(`Failed to open DM: ${res.status} ${await res.text()}`);
@@ -63,17 +71,7 @@ export class DiscordAgent extends Agent {
     }
   }
 
-  async onGuildMessage(_msg: {
-    guildId: string;
-    channelId: string;
-    authorId: string;
-    content: string;
-    id: string;
-  }): Promise<void> {
-    throw new Error("onGuildMessage not implemented");
-  }
-
-  protected async sendChannelMessage(
+  private async sendChannelMessage(
     channelId: string,
     msg: MessageParams | string
   ) {
@@ -82,47 +80,10 @@ export class DiscordAgent extends Agent {
     const res = await discordFetch(`/channels/${channelId}/messages`, {
       method: "POST",
       botToken: this.env.DISCORD_BOT_TOKEN,
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
     });
     if (!res.ok)
       console.error("Discord API HTTP", res.status, await res.text());
-  }
-
-  async fetchChannelMessages(
-    channelId: string,
-    opts: {
-      limit?: number;
-      before?: string;
-      after?: string;
-      around?: string;
-    } = {}
-  ): Promise<DiscordMessage[]> {
-    const qs = new URLSearchParams();
-    if (opts.limit) qs.set("limit", String(opts.limit));
-    if (opts.before) qs.set("before", opts.before);
-    if (opts.after) qs.set("after", opts.after);
-    if (opts.around) qs.set("around", opts.around);
-    const res = await discordFetch(`/channels/${channelId}/messages?${qs}`, {
-      method: "GET",
-      botToken: this.env.DISCORD_BOT_TOKEN
-    });
-    if (!res.ok) throw new Error("Failed to read messages");
-    return res.json<DiscordMessage[]>();
-  }
-
-  async sendFollowup(interactionToken: string, msg: MessageParams | string) {
-    const body: MessageParams =
-      typeof msg === "string" ? { content: msg } : msg;
-    const res = await fetch(
-      `${DISCORD_API}/webhooks/${this.env.DISCORD_APPLICATION_ID}/${interactionToken}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify(body)
-      }
-    );
-    if (!res.ok)
-      console.error("Discord followup HTTP", res.status, await res.text());
   }
 
   // because discord messages have a 2k char limit and llms like to go long sometimes

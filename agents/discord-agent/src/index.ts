@@ -1,76 +1,46 @@
 import { DiscordAgent } from "./discord/agent";
-import type { DiscordMessage } from "./discord/agent";
 import {
-  DEFAULT_DM_BLOCKS,
-  DEFAULT_GUILD_BLOCKS,
+  DEFAULT_BLOCKS,
   SYSTEM_INSTRUCTIONS,
   MESSAGE_BUFFER_CONFIG,
-  SUMMARY_PROMPT
+  SUMMARY_PROMPT,
+  MODEL,
+  MODEL_SUMMARY,
 } from "./constants";
 import { PersistedObject } from "./persisted";
-import { callLlm, Memory, type MemoryBlockI } from "./utils";
-import { callTool, tools } from "./tools";
-
-type ChannelCheckpoint = {
-  oldestSeenMessageId?: string; // Oldest message we've processed (everything before this is summarized)
-  summary?: string; // Summary of all messages before oldestSeenMessageId
-};
+import { renderMemory, type MemoryBlockI } from "./memory";
+import { tools } from "./tools";
+import { generateText, stepCountIs } from "ai";
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { getAgentByName } from "agents";
+import { renderDashboard } from "./ui";
 
 type MemoryState = {
   system: string;
   blocks: MemoryBlockI[];
   messageBuffer: string[]; // Array of message IDs in the current context window
-  channelCheckpoints?: Record<string, ChannelCheckpoint>; // Per-channel checkpoints
 };
 
 export class MyAgent extends DiscordAgent {
   readonly memory: MemoryState;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const { kv, sql } = ctx.storage;
-    this.memory = PersistedObject<MemoryState>(kv, { prefix: "memory_" });
-
-    if (!this.memory.channelCheckpoints) {
-      this.memory.channelCheckpoints = {};
-    }
+    this.memory = PersistedObject<MemoryState>(kv, {
+      prefix: "memory_",
+      defaults: {
+        system: SYSTEM_INSTRUCTIONS,
+        blocks: DEFAULT_BLOCKS,
+        messageBuffer: [],
+      },
+    });
 
     sql.exec(
       "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, role TEXT NOT NULL, content TEXT, tool_calls TEXT, tool_call_id TEXT)"
     );
   }
 
-  // First time booting up for a DM
-  async dmOnBoot(userId: string) {
-    this.info.userId = userId;
-    if (!this.memory.system) {
-      this.memory.system = SYSTEM_INSTRUCTIONS;
-    }
-
-    if (!this.memory.blocks || this.memory.blocks.length === 0) {
-      this.memory.blocks = DEFAULT_DM_BLOCKS;
-    }
-
-    if (!this.memory.messageBuffer) {
-      this.memory.messageBuffer = [];
-    }
-  }
-
-  // First time booting up for a DM
-  async guildOnBoot(guildId: string) {
-    this.info.guildId = guildId;
-    if (!this.memory.system) {
-      this.memory.system = SYSTEM_INSTRUCTIONS;
-    }
-
-    if (!this.memory.blocks || this.memory.blocks.length === 0) {
-      this.memory.blocks = DEFAULT_GUILD_BLOCKS;
-    }
-
-    if (!this.memory.messageBuffer) {
-      this.memory.messageBuffer = [];
-    }
-  }
-  // Helper method to add a message to SQLite and buffer
   private addMessage(message: {
     id: string;
     role: "user" | "assistant" | "tool";
@@ -91,50 +61,36 @@ export class MyAgent extends DiscordAgent {
     this.memory.messageBuffer = [...this.memory.messageBuffer, message.id];
   }
 
-  // Helper method to get messages from the current context window
-  private async getMessages() {
+  private async getMessages(): Promise<
+    { role: "user" | "assistant"; content: string }[]
+  > {
     const { sql } = this.ctx.storage;
 
     if (this.memory.messageBuffer.length === 0) {
       return [];
     }
 
-    // Get messages by IDs in the buffer
     const placeholders = this.memory.messageBuffer.map(() => "?").join(",");
     const cursor = sql.exec(
       `SELECT * FROM messages WHERE id IN (${placeholders})`,
       ...this.memory.messageBuffer
     );
 
-    // Build a map of messages by ID
     const messageMap = new Map<string, any>();
     for (const row of cursor) {
-      const message: any = {
-        role: row.role
-      };
-
-      if (row.content) {
-        message.content = row.content;
+      if (row.role === "user" || (row.role === "assistant" && row.content)) {
+        messageMap.set(row.id as string, {
+          role: row.role as "user" | "assistant",
+          content: row.content as string,
+        });
       }
-
-      if (row.tool_calls) {
-        message.tool_calls = JSON.parse(row.tool_calls as string);
-      }
-
-      if (row.tool_call_id) {
-        message.tool_call_id = row.tool_call_id;
-      }
-
-      messageMap.set(row.id as string, message);
     }
 
-    // Return messages in buffer order
     return this.memory.messageBuffer
       .map((id) => messageMap.get(id))
       .filter((msg) => msg !== undefined);
   }
 
-  // Summarize old messages and implement rolling window
   private async summarizeAndPruneMessages() {
     const bufferSize = this.memory.messageBuffer.length;
 
@@ -177,25 +133,16 @@ export class MyAgent extends DiscordAgent {
       .filter((msg) => msg !== undefined);
 
     // Call LLM to summarize the conversation
-    const message: any = await callLlm({
-      model: "moonshotai/kimi-k2-0905",
-      messages: [
-        {
-          role: "system",
-          content: SUMMARY_PROMPT
-        },
-        {
-          role: "user",
-          content: `Conversation to summarize:\n${JSON.stringify(messagesToSummarize, null, 2)}`
-        }
-      ],
-      provider: { only: ["groq"] },
-      tools: tools
+    const openrouter = createOpenRouter({
+      apiKey: this.env.OPENROUTER_API_KEY,
     });
 
-    const summary = message.content;
+    const { text: summary } = await generateText({
+      model: openrouter(MODEL_SUMMARY),
+      system: SUMMARY_PROMPT,
+      prompt: `Conversation to summarize:\n${JSON.stringify(messagesToSummarize, null, 2)}`,
+    });
 
-    // Create a summary message and add to DB
     const summaryMessageId = `${MESSAGE_BUFFER_CONFIG.SUMMARY_MESSAGE_ID_PREFIX}${Date.now()}`;
     const summaryMessage = `The following is a summary of the previous messages:\n${summary}`;
 
@@ -209,9 +156,7 @@ export class MyAgent extends DiscordAgent {
       null
     );
 
-    // Update buffer: [summaryId, ...remainingIds]
     this.memory.messageBuffer = [summaryMessageId, ...idsToKeep];
-
     console.log(
       `Summarized ${numToRemove} messages, kept ${numToKeep} messages`
     );
@@ -223,279 +168,153 @@ export class MyAgent extends DiscordAgent {
     content: string;
     id: string;
   }) {
-    if (!this.info.userId) this.dmOnBoot(msg.authorId);
-    if (msg.content.startsWith("!")) {
-      const [cmd, args] = msg.content.split(" ", 2);
-      if (cmd === "!block") {
-        const block = this.memory.blocks.find((b) => b.label === args);
-        this.sendDm(
-          `\`\`\`\n${block?.value.replaceAll("```", "\`\`\`")}\n\`\`\``
-        );
-        return;
-      }
-
-      if (cmd === "!messages") {
-        const messages = await this.getMessages();
-        this.sendDm(JSON.stringify(messages, null, 2));
-        return;
-      }
-      return;
-    }
-    const reply: string = await this.doSomethingSmart(msg.content);
-
-    // Split reply into chunks if it exceeds Discord's 4000 character limit
+    this.info.userId = msg.authorId;
+    const reply = await this.chat(msg.content);
     await this.sendDm(reply);
   }
 
-  async onGuildMessage(msg: {
-    guildId: string;
-    channelId: string; // thread id if in a thread
-    authorId: string;
-    content: string;
-    id: string;
-    mentions?: any[];
-  }) {
-    if (!this.info.guildId) this.guildOnBoot(msg.guildId);
-    console.log(
-      `[Agent] Guild: ${msg.guildId}, Channel: ${msg.channelId}, Memory blocks: ${this.memory.blocks.length}`
-    );
-    console.log(this.memory.blocks.map((b) => b.value));
-    // Build stateless context from Discord
-    const ctx = await this.buildContextFromDiscord(msg.channelId);
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
 
-    // Compile system with your existing memory blocks (guild-wide)
-    let systemPrompt = this.memory.system;
-    const memory = new Memory(this.memory.blocks, []);
-    systemPrompt += memory.compile();
-
-    // Turn Discord history into chat turns
-    const turns = this.toChatHistory(ctx.recentMessages);
-
-    // Prepend summary if exists
-    if (ctx.summary) {
-      turns.unshift({
-        role: "user",
-        content: `[Earlier conversation summary]:\n${ctx.summary}`
-      });
+    if (url.pathname === "/api/state") {
+      return this.getStateJson();
     }
 
-    // Add the current user prompt
-    turns.push({ role: "user", content: msg.content });
-    const messages: any = [{ role: "system", content: systemPrompt }, ...turns];
-
-    while (true) {
-      // Call LLM (no guild logs stored in your DO)
-      const message: any = await callLlm({
-        model: "moonshotai/kimi-k2-0905",
-        messages,
-        provider: { only: ["groq"] },
-        tools
-      });
-
-      // Handle tool calls
-      if (message.tool_calls && message.tool_calls.length > 0) {
-        // Add assistant message with tool calls
-        messages.push({
-          role: "assistant",
-          tool_calls: message.tool_calls
-        });
-
-        // Execute tools and add results
-        for (const toolCall of message.tool_calls) {
-          const response = await callTool(
-            toolCall.function.name,
-            JSON.parse(toolCall.function.arguments)
-          );
-
-          // Add tool result message
-          messages.push({
-            role: "tool",
-            content:
-              typeof response === "string"
-                ? response
-                : JSON.stringify(response),
-            tool_call_id: toolCall.id
-          });
-        }
-        continue;
-      }
-
-      const content = message.content;
-      await this.sendChannelMessage(msg.channelId, content);
-      break;
-    }
-  }
-
-  // Convert Discord messages to chat format by author
-  private toChatHistory(msgs: DiscordMessage[]) {
-    const botId = this.env.DISCORD_APPLICATION_ID;
-    // Oldest first
-    const sorted = [...msgs].sort((a, b) =>
-      BigInt(a.id) < BigInt(b.id) ? -1 : 1
-    );
-    return sorted.map((m) => ({
-      role: m.author.id === botId ? ("assistant" as const) : ("user" as const),
-      content:
-        m.author.id === botId
-          ? m.content || ""
-          : `[User: ${m.author.id}] ${m.content || ""}`
-    }));
-  }
-
-  private async buildContextFromDiscord(channelId: string) {
-    const checkpoint = this.memory.channelCheckpoints![channelId] || {};
-
-    // Fetch most recent 100 messages
-    const recentMessages = await this.fetchChannelMessages(channelId, {
-      limit: 100
+    return new Response(renderDashboard(), {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
     });
+  }
 
-    if (recentMessages.length === 0) {
-      return { summary: checkpoint.summary || "", recentMessages: [] };
-    }
+  private getStateJson(): Response {
+    const { sql } = this.ctx.storage;
 
-    // Find oldest message in what we just fetched
-    const oldestRecent = recentMessages.reduce((oldest, msg) =>
-      BigInt(msg.id) < BigInt(oldest.id) ? msg : oldest
-    );
-
-    // If we got 100 messages AND we haven't seen the oldest one before,
-    // it means there are MORE messages we haven't processed
-    const needsSummarization =
-      recentMessages.length === 100 &&
-      (!checkpoint.oldestSeenMessageId ||
-        oldestRecent.id !== checkpoint.oldestSeenMessageId);
-
-    let summary = checkpoint.summary || "";
-
-    if (needsSummarization) {
-      // Fetch older messages (everything before the oldest recent message)
-      const olderMessages = await this.fetchChannelMessages(channelId, {
-        limit: 100,
-        before: oldestRecent.id
+    // Get all messages from DB
+    const allMessages: Array<{
+      id: unknown;
+      role: unknown;
+      content: unknown;
+      tool_calls: unknown;
+      tool_call_id: unknown;
+    }> = [];
+    for (const row of sql.exec("SELECT * FROM messages")) {
+      allMessages.push({
+        id: row.id,
+        role: row.role,
+        content: row.content,
+        tool_calls: row.tool_calls
+          ? JSON.parse(row.tool_calls as string)
+          : null,
+        tool_call_id: row.tool_call_id,
       });
-
-      if (olderMessages.length > 0) {
-        // Summarize the older messages
-        summary = await this.summarizeMessages(summary, olderMessages);
-
-        // Update checkpoint: we've now processed up to oldestRecent
-        this.memory.channelCheckpoints![channelId] = {
-          oldestSeenMessageId: oldestRecent.id,
-          summary
-        };
-      }
     }
 
-    return {
-      summary,
-      recentMessages
+    // Get buffered message IDs
+    const bufferIds = this.memory.messageBuffer || [];
+
+    // Get messages in current context
+    const contextMessages = bufferIds
+      .map((id) => allMessages.find((m) => m.id === id))
+      .filter(Boolean);
+
+    const state = {
+      info: {
+        userId: this.info.userId,
+        dmChannel: this.info.dmChannel,
+      },
+      memory: {
+        system: this.memory.system,
+        blocks: this.memory.blocks,
+      },
+      context: {
+        bufferSize: bufferIds.length,
+        maxSize: MESSAGE_BUFFER_CONFIG.MAX_MESSAGES,
+        messages: contextMessages,
+      },
+      storage: {
+        totalMessages: allMessages.length,
+        allMessages,
+      },
     };
-  }
 
-  private async summarizeMessages(
-    previousSummary: string,
-    msgs: DiscordMessage[]
-  ): Promise<string> {
-    // Sort oldest first
-    const sorted = msgs.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
-
-    const text = sorted
-      .map((m) => `${m.author.username ?? m.author.id}: ${m.content ?? ""}`)
-      .join("\n");
-
-    const completion: any = await callLlm({
-      model: "moonshotai/kimi-k2-0905",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are summarizing a Discord thread. Merge new messages into the existing summary. Keep key context: names, decisions, questions, links, topics discussed. Be concise but thorough."
-        },
-        {
-          role: "user",
-          content: `Previous summary:\n${previousSummary || "(none)"}\n\nNew messages to add:\n${text}\n\nProvide an UPDATED summary that includes both old and new context.`
-        }
-      ],
-      provider: { only: ["groq"] }
+    return new Response(JSON.stringify(state, null, 2), {
+      headers: { "Content-Type": "application/json" },
     });
-
-    return completion.content?.trim() || previousSummary || "";
   }
 
-  private async doSomethingSmart(userPrompt: string) {
+  private async chat(userPrompt: string) {
     // Add user message to database
     this.addMessage({
       id: crypto.randomUUID(),
       role: "user",
-      content: userPrompt
+      content: userPrompt,
     });
 
     // Check if we need to summarize and prune messages (rolling window)
     await this.summarizeAndPruneMessages();
 
-    while (true) {
-      // Build system prompt with memory
-      let systemPrompt = this.memory.system;
-      const memory = new Memory(this.memory.blocks, []);
-      systemPrompt += memory.compile();
+    // Build system prompt with memory
+    let systemPrompt = this.memory.system;
+    const memory = renderMemory(this.memory.blocks);
+    systemPrompt += memory;
 
-      // Get conversation history from database
-      const messages = await this.getMessages();
+    // Get conversation history from database
+    const messages = await this.getMessages();
 
-      // Prepend system message
-      const allMessages = [
-        { role: "system", content: systemPrompt },
-        ...messages
-      ];
+    // Create OpenRouter client
+    const openrouter = createOpenRouter({
+      apiKey: this.env.OPENROUTER_API_KEY,
+    });
 
-      const message: any = await callLlm({
-        model: "moonshotai/kimi-k2-0905",
-        messages: allMessages,
-        provider: { only: ["groq"] },
-        tools: tools
-      });
+    // Generate response with automatic tool execution
+    const result = await generateText({
+      model: openrouter(MODEL),
+      system: systemPrompt,
+      messages,
+      tools,
+      stopWhen: stepCountIs(10),
+    });
+    console.log(JSON.stringify(result))
 
-      // Handle tool calls
-      if (message.tool_calls && message.tool_calls.length > 0) {
+    // Store tool calls and results from steps
+    for (const step of result.steps || []) {
+      if (step.toolCalls && step.toolCalls.length > 0) {
         // Add assistant message with tool calls
         this.addMessage({
           id: crypto.randomUUID(),
           role: "assistant",
-          tool_calls: message.tool_calls
+          tool_calls: step.toolCalls.map((tc) => ({
+            id: tc.toolCallId,
+            function: {
+              name: tc.toolName,
+              arguments: JSON.stringify(tc.input),
+            },
+          })),
         });
 
-        // Execute tools and add results
-        for (const toolCall of message.tool_calls) {
-          const response = await callTool(
-            toolCall.function.name,
-            JSON.parse(toolCall.function.arguments)
-          );
-
-          // Add tool result message
+        // Add tool results
+        for (const toolResult of step.toolResults || []) {
           this.addMessage({
             id: crypto.randomUUID(),
             role: "tool",
             content:
-              typeof response === "string"
-                ? response
-                : JSON.stringify(response),
-            tool_call_id: toolCall.id
+              typeof toolResult.output === "string"
+                ? toolResult.output
+                : JSON.stringify(toolResult.output),
+            tool_call_id: toolResult.toolCallId,
           });
         }
-        continue;
       }
-
-      // Add assistant's final response
-      const content = message.content;
-      this.addMessage({
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: content
-      });
-
-      return content;
     }
+
+    // Add assistant's final response
+    const responseText = result.text || "I completed the action but have no additional response.";
+    this.addMessage({
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: responseText,
+    });
+
+    return responseText;
   }
 }
 
@@ -508,8 +327,15 @@ export default {
       await gateway.start();
       return new Response("ok");
     }
+
+    // Route dashboard and API requests to the agent
+    if (url.pathname === "/" || url.pathname.startsWith("/api")) {
+      const agent = await getAgentByName(env.AGENT, "default");
+      return agent.fetch(request);
+    }
+
     return new Response("Not found", { status: 404 });
-  }
+  },
 };
 
 export { DiscordGateway } from "./discord/gateway";

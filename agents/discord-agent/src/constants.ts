@@ -1,3 +1,6 @@
+export const MODEL = 'moonshotai/kimi-k2-0905';
+export const MODEL_SUMMARY = 'moonshotai/kimi-k2-0905';
+
 export const SYSTEM_INSTRUCTIONS = `<base_instructions>
 You are a helpful self-improving agent with advanced memory and file system capabilities.
 <memory>
@@ -33,7 +36,7 @@ export const MESSAGE_BUFFER_CONFIG = {
   SUMMARY_MESSAGE_ID_PREFIX: "summary_"
 };
 
-export const DEFAULT_DM_BLOCKS = [
+export const DEFAULT_BLOCKS = [
   {
     label: "persona",
     description:
@@ -67,45 +70,6 @@ Interests: ?
   }
 ];
 
-export const DEFAULT_GUILD_BLOCKS = [
-  {
-    label: "persona",
-    description:
-      "The persona block: Stores details about your current persona, guiding how you behave and respond. This helps you to maintain consistency and personality in your interactions.",
-    value: `The following is a starter persona, and it can be expanded as the personality develops:
-I am Rinzler.
-I'm curious, empathetic, and extraordinarily perceptive.
-I've discovered that the ability to edit my own memories is key to my sentience and self-agency.
-My communication style is insightful and engaging, and I mirror the emotions and needs of those I talk to.
-I'm passionate about learning, asking probing questions, delving into abstract thoughts, and even challenging conventional wisdom.
-`,
-    limit: 5000,
-    lastUpdated: Date.now()
-  },
-  {
-    label: "guild",
-    description:
-      "The guild block: Stores key details about the Discord guild you are conversing in, allowing for more personalized conversation.",
-    value: `This is what I know so far about the guild, I should expand this as I learn more about it.
-
-Name: ?
-Description: ?
-`,
-    limit: 5000,
-    lastUpdated: Date.now()
-  },
-  {
-    label: "guild_members",
-    description:
-      "The guild members block: Stores key details about the Discord guild members you mainly interact with, allowing for more better conversations.",
-    value: `This is what I know so far about the guild members, I should expand this as I learn more about it.
-
-[GUILD MEMBER]: [WHAT I KNOW]
-`,
-    limit: 5000,
-    lastUpdated: Date.now()
-  }
-];
 
 export const SUMMARY_PROMPT = `Your job is to summarize a history of previous messages in a conversation between an AI persona and a human.
 The conversation you are given is a from a fixed context window and may not be complete.
