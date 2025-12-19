@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "types": "wrangler types env.d.ts --include-runtime false",
-    "deploy": "vite build && wrangler deploy"
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
     "@ai-sdk/openai": "^2.0.73",
